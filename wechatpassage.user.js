@@ -1613,7 +1613,53 @@ function restoreArticle(doc, options = {}) {
  *
  * 为什么可以这么简单：本脚本运行在 mp.weixin.qq.com 页面上，`fetch('/')` 是**同源请求**，
  * 浏览器自动带上公众号登录 Cookie —— 不需要 AppID、不需要扫码自建会话、不需要 GM API。
+ *
+ * ⚠️ 这里有一个必须踩过的坑：后台首页的引导脚本是
+ *
+ *     window.wx.commonData = { version: "5.0.0", data: { t: "" || "",
+ *       nick_name_decode: handlerNickname("", false), time: "" || new Date().getTime()/1000, ... } }
+ *
+ * 它不是 JSON —— 里面既有 `a || b`、`"" * 1` 这类表达式，也有**页面自身作用域的
+ * `handlerNickname()` 调用**。所以既不能 `JSON.parse`，也不能直接求值：
+ * 直接求值会抛 `ReferenceError: handlerNickname is not defined`，
+ * 而如果把这个异常吞掉，表现就是「明明登录成功了却永远显示未登录」。
+ * 正确做法是在注入桩函数的作用域里求值。
  */
+
+/** `<script>` 里出现这个锚点才说明页面带了上下文引导脚本。 */
+const COMMON_DATA_ANCHOR = 'window.wx.commonData';
+
+/** 依次尝试的上下文来源（同源）。 */
+const CONTEXT_SOURCES = ['/', '/cgi-bin/home?t=home/index&lang=zh_CN&token='];
+
+const NAMED_ENTITIES = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  nbsp: '\u00a0',
+  ensp: '\u2002',
+  emsp: '\u2003',
+  copy: '\u00a9',
+};
+
+/** 解码 HTML 实体（微信的 `nick_name` 是编码过的）。 */
+function decodeHtmlEntities(value) {
+  return String(value == null ? '' : value).replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, body) => {
+    if (body[0] === '#') {
+      const isHex = body[1] === 'x' || body[1] === 'X';
+      const code = Number.parseInt(body.slice(isHex ? 2 : 1), isHex ? 16 : 10);
+      if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) return match;
+      try {
+        return String.fromCodePoint(code);
+      } catch {
+        return match;
+      }
+    }
+    return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, body) ? NAMED_ENTITIES[body] : match;
+  });
+}
 
 /**
  * 用括号配对从源码里截出一个对象字面量（跳过字符串与注释），避免执行整段页面脚本。
@@ -1675,6 +1721,51 @@ function extractObjectLiteral(text, startIdx) {
   return null;
 }
 
+/** 页面引导脚本里已知会用到的桩函数。 */
+const LITERAL_HELPERS = ['handlerNickname'];
+
+/** 未知标识符的统一桩：既能当函数调用，也能当对象取值。 */
+function universalStub(input) {
+  return typeof input === 'string' ? input : '';
+}
+
+/**
+ * 求值 `commonData` 字面量。
+ *
+ * 关键点：注入 `window` 与页面函数桩。实测该字面量里会调用
+ * `handlerNickname(...)`，缺了它整段求值必然失败 —— 而早先的实现把这个
+ * ReferenceError 吞掉了，表现就是「登录成功却永远显示未登录」。
+ *
+ * 另外做了**自愈**：如果微信以后又引入新的页面函数，我们从
+ * `X is not defined` 里把名字抠出来补个桩再重试，避免同类问题再次静默复发。
+ *
+ * @param {string} literal
+ * @param {Record<string, Function>} [helpers]
+ * @returns {object|null}
+ */
+function evaluateCommonDataLiteral(literal, helpers = {}) {
+  if (!literal) return null;
+
+  const stubs = { handlerNickname: universalStub, ...helpers };
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const names = Object.keys(stubs);
+    const values = names.map((name) => stubs[name]);
+    try {
+      const factory = new Function('window', ...names, `return (${literal});`);
+      const value = factory({ wx: {} }, ...values);
+      return value && typeof value === 'object' ? value : null;
+    } catch (error) {
+      const message = error && error.message ? error.message : '';
+      const missing = /([A-Za-z_$][\w$]*)\s+is not defined/.exec(message);
+      if (!missing || Object.prototype.hasOwnProperty.call(stubs, missing[1])) return null;
+      // 补桩后重试，而不是把异常直接吞掉
+      stubs[missing[1]] = universalStub;
+    }
+  }
+  return null;
+}
+
 /**
  * 从页面 HTML 中解析 `window.wx.commonData`。
  * @param {string} html
@@ -1682,48 +1773,100 @@ function extractObjectLiteral(text, startIdx) {
  */
 function parseCommonData(html) {
   if (!html) return null;
-  const anchors = ['window.wx.commonData', 'window.wx.commonData='];
-  let idx = -1;
-  for (const anchor of anchors) {
-    idx = html.indexOf(anchor);
-    if (idx !== -1) break;
-  }
-  if (idx === -1) return null;
+  const anchorIdx = html.indexOf(COMMON_DATA_ANCHOR);
+  if (anchorIdx === -1) return null;
 
-  const literal = extractObjectLiteral(html, idx);
+  const literal = extractObjectLiteral(html, anchorIdx);
   if (!literal) return null;
 
-  try {
-    // 字面量来自微信自己页面的内联脚本，这里只做取值，不产生副作用
-    const factory = new Function(`return (${literal});`);
-    const data = factory();
-    return data && typeof data === 'object' ? data : null;
-  } catch {
-    return null;
+  return evaluateCommonDataLiteral(literal);
+}
+
+/**
+ * 分析一段 HTML 里的上下文引导脚本状态，用于给出可读的失败原因。
+ * @param {string} html
+ */
+function inspectCommonData(html) {
+  const text = String(html || '');
+  const anchorIdx = text.indexOf(COMMON_DATA_ANCHOR);
+  const anchorFound = anchorIdx !== -1;
+  const literal = anchorFound ? extractObjectLiteral(text, anchorIdx) : null;
+  const literalFound = Boolean(literal);
+  const parsed = literalFound ? evaluateCommonDataLiteral(literal) : null;
+
+  let evaluateError = null;
+  if (literalFound && !parsed) {
+    // 再跑一次，把真实异常暴露出来，方便定位是哪个标识符缺失
+    try {
+      const factory = new Function('window', ...LITERAL_HELPERS, `return (${literal});`);
+      factory({ wx: {} }, ...LITERAL_HELPERS.map(() => () => ''));
+    } catch (error) {
+      evaluateError = error && error.message ? error.message : String(error);
+    }
+    if (!evaluateError) evaluateError = '字面量求值结果不是对象';
   }
+
+  return {
+    htmlLength: text.length,
+    anchorFound,
+    literalFound,
+    literalLength: literal ? literal.length : 0,
+    parsed: Boolean(parsed),
+    evaluateError,
+    isLoginPage: /扫码登录|scanlogin|使用账号登录/.test(text) && !anchorFound,
+  };
+}
+
+/**
+ * 选昵称。
+ *
+ * 刻意**优先用原始字段自行解码**，而不是 `nick_name_decode`：
+ * 后者是页面函数 `handlerNickname()` 的产物，而我们注入的是桩函数、不会真正解码。
+ * 依赖它就等于依赖一个我们不控制的值；`nick_name` 是 HTML 实体编码的原始值，
+ * 自己解码结果确定。
+ */
+function pickNickname(data) {
+  for (const value of [data.nick_name, data.real_nick_name]) {
+    const decoded = decodeHtmlEntities(value).trim();
+    if (decoded) return decoded;
+  }
+  for (const value of [data.nick_name_decode, data.real_nick_name_decode]) {
+    const text = String(value == null ? '' : value).trim();
+    if (text) return text;
+  }
+  return '';
 }
 
 function normalizeContext(commonData, fallbackToken) {
   const data = (commonData && commonData.data) || {};
   const token = data.t || fallbackToken || '';
   if (!token) return null;
+
   return {
-    token,
+    token: String(token),
     ticket: data.ticket || '',
     ticketId: data.user_name || '',
     svrTime: data.time || data.svr_time || '',
-    nickname: data.nick_name || '',
+    nickname: pickNickname(data),
     userName: data.user_name || '',
-    avatar: data.headimgurl || '',
+    avatar: data.head_img || data.headimgurl || '',
+    // ticket 缺失时图片上传接口会失败，提前标记出来给界面提示
+    complete: Boolean(data.ticket),
     raw: commonData,
   };
+}
+
+async function readFromWindow(win) {
+  if (!win || !win.wx || !win.wx.commonData || !win.wx.commonData.data) return null;
+  if (!win.wx.commonData.data.t) return null;
+  return win.wx.commonData;
 }
 
 /**
  * 读取公众号后台上下文。
  *
  * @param {{fetchImpl?:Function, win?:Window, force?:boolean}} [options]
- * @returns {Promise<{ok:boolean, context:object|null, error:string|null}>}
+ * @returns {Promise<{ok:boolean, context:object|null, error:string|null, diagnostics:object|null}>}
  */
 async function getWxContext(options = {}) {
   const win = options.win || (typeof window !== 'undefined' ? window : null);
@@ -1731,15 +1874,18 @@ async function getWxContext(options = {}) {
     options.fetchImpl ||
     (win && typeof win.fetch === 'function' ? win.fetch.bind(win) : typeof fetch === 'function' ? fetch : null);
 
-  if (!fetchImpl) return { ok: false, context: null, error: '当前环境不支持 fetch' };
-
-  // 1) 后台页面本身已经加载好了 commonData，直接用
-  if (win && win.wx && win.wx.commonData && win.wx.commonData.data && win.wx.commonData.data.t) {
-    const context = normalizeContext(win.wx.commonData, '');
-    if (context) return { ok: true, context, error: null };
+  if (!fetchImpl) {
+    return { ok: false, context: null, error: '当前环境不支持 fetch', diagnostics: null };
   }
 
-  // 2) 从 URL 上的 token 兜底（后台各页面 URL 一般带 token）
+  // 1) 后台页面本身已经加载好了 commonData，直接用（最可靠）
+  const fromWindow = await readFromWindow(win);
+  if (fromWindow) {
+    const context = normalizeContext(fromWindow, '');
+    if (context) return { ok: true, context, error: null, diagnostics: null };
+  }
+
+  // 2) URL 上的 token 作为最后兜底（后台各页面 URL 一般带 token）
   let fallbackToken = '';
   try {
     if (win && win.location) fallbackToken = new URL(win.location.href).searchParams.get('token') || '';
@@ -1747,25 +1893,39 @@ async function getWxContext(options = {}) {
     /* 忽略 */
   }
 
-  try {
-    const res = await fetchImpl('/', { credentials: 'include', redirect: 'follow' });
-    if (!res.ok) {
-      return { ok: false, context: null, error: `读取公众号首页失败（HTTP ${res.status}）` };
+  let lastDiagnostics = null;
+
+  for (const source of CONTEXT_SOURCES) {
+    let html = '';
+    let status = 0;
+    try {
+      const res = await fetchImpl(source, { credentials: 'include', redirect: 'follow' });
+      status = res.status;
+      if (!res.ok) continue;
+      html = await res.text();
+    } catch (err) {
+      lastDiagnostics = { source, error: err && err.message ? err.message : String(err) };
+      continue;
     }
-    const html = await res.text();
+
     const commonData = parseCommonData(html);
     const context = normalizeContext(commonData, fallbackToken);
-    if (!context) {
-      return {
-        ok: false,
-        context: null,
-        error: '未检测到公众号登录态，请先在当前浏览器登录 mp.weixin.qq.com',
-      };
-    }
-    return { ok: true, context, error: null };
-  } catch (err) {
-    return { ok: false, context: null, error: `读取公众号信息失败：${err && err.message ? err.message : err}` };
+    if (context) return { ok: true, context, error: null, diagnostics: null };
+
+    const diagnostics = { ...inspectCommonData(html), source, status };
+    if (!lastDiagnostics || diagnostics.anchorFound) lastDiagnostics = diagnostics;
   }
+
+  const reason = lastDiagnostics && lastDiagnostics.anchorFound
+    ? `页面里有上下文引导脚本但解析失败${lastDiagnostics.evaluateError ? `（${lastDiagnostics.evaluateError}）` : ''}`
+    : '页面里没有上下文引导脚本，说明当前没有有效的登录态';
+
+  return {
+    ok: false,
+    context: null,
+    diagnostics: lastDiagnostics,
+    error: `未检测到公众号登录态：${reason}。请先在当前浏览器登录 mp.weixin.qq.com，再点「重新检测」。`,
+  };
 }
 
 /* ---------- src/wx/upload.js ---------- */
@@ -3140,6 +3300,7 @@ function createPanel(options = {}) {
     articleKey: 0,
     ctx: null,
     ctxError: '',
+    ctxDiagnostics: null,
     busy: '',
     progress: 0,
     error: '',
@@ -3170,8 +3331,18 @@ function createPanel(options = {}) {
 
   const loadContext = async () => {
     const result = await getWxContext({ win });
-    if (result.ok) setState({ ctx: result.context, ctxError: '' });
-    else setState({ ctx: null, ctxError: result.error || '未登录' });
+    if (result.ok) {
+      setState({
+        ctx: result.context,
+        ctxError: '',
+        ctxDiagnostics: null,
+        warnings: result.context.complete
+          ? state.warnings
+          : [...state.warnings, '登录态缺少 ticket 字段，图片转存可能失败；建议重新登录一次公众号后台'],
+      });
+    } else {
+      setState({ ctx: null, ctxError: result.error || '未登录', ctxDiagnostics: result.diagnostics || null });
+    }
     return result;
   };
 
@@ -3388,11 +3559,57 @@ function createPanel(options = {}) {
       el(doc, 'button', { class: 'wp-btn wp-btn--ghost', 'data-act': 'open-login-page', text: '打开登录页' }),
       el(doc, 'button', { class: 'wp-btn wp-btn--plain', 'data-act': 'qr-login', text: '扫码登录' }),
       el(doc, 'button', { class: 'wp-btn wp-btn--plain', 'data-act': 'recheck-login', text: '重新检测' }),
+      state.ctx ? null : el(doc, 'button', { class: 'wp-btn wp-btn--plain', 'data-act': 'copy-diagnostics', text: '复制诊断信息' }),
     ]);
   }
 
-  function renderHome() {
-    const body = el(doc, 'div', { class: 'wp-body' });
+  /** 把登录态探测的中间结果整理成可以贴给别人的一段文字。 */
+  function buildDiagnosticReport() {
+    const d = state.ctxDiagnostics || {};
+    const lines = [
+      'WeChatPassage 诊断信息',
+      `时间：${new Date().toISOString()}`,
+      `页面：${win.location ? win.location.href : '(未知)'}`,
+      `UA：${win.navigator && win.navigator.userAgent ? win.navigator.userAgent : '(未知)'}`,
+      `面板：${state.ctx ? '已登录' : '未登录'}`,
+      d.source !== undefined ? `上下文来源：${d.source}（HTTP ${d.status === undefined ? '?' : d.status}）` : '上下文来源：(未尝试)',
+      d.htmlLength !== undefined ? `页面长度：${d.htmlLength} 字节` : null,
+      d.anchorFound !== undefined
+        ? `引导脚本锚点：${d.anchorFound ? '找到' : '未找到'}`
+        : null,
+      d.literalFound !== undefined
+        ? `字面量：${d.literalFound ? `已截取（${d.literalLength} 字符）` : '未截取'}`
+        : null,
+      d.parsed !== undefined ? `解析结果：${d.parsed ? '成功' : '失败'}` : null,
+      d.evaluateError ? `求值错误：${d.evaluateError}` : null,
+      `错误信息：${state.ctxError || '(无)'}`,
+    ].filter(Boolean);
+    return lines.join('\n');
+  }
+
+  /**
+   * 登录态探测失败时，把「卡在哪一步」直接摆给用户看。
+   * 这类问题以前只能靠猜，诊断信息能立刻区分是「没登录」「页面变了」还是「解析挂了」。
+   */
+  function renderDiagnosticsHint() {
+    const d = state.ctxDiagnostics;
+    if (state.ctx || !d) return null;
+
+    const parts = [];
+    if (d.source !== undefined) parts.push(`来源 ${d.source}`);
+    if (d.htmlLength !== undefined) parts.push(`${d.htmlLength} 字节`);
+    if (d.anchorFound !== undefined) parts.push(d.anchorFound ? '有引导脚本' : '无引导脚本');
+    if (d.parsed !== undefined) parts.push(d.parsed ? '已解析' : '解析失败');
+    if (d.evaluateError) parts.push(d.evaluateError);
+
+    return el(doc, 'p', {
+      class: 'wp-hint',
+      'data-role': 'diagnostics',
+      text: parts.length ? `诊断：${parts.join(' · ')}` : '诊断：暂无信息',
+    });
+  }
+
+  function renderHome() {    const body = el(doc, 'div', { class: 'wp-body' });
     const loginLine = state.ctx
       ? el(doc, 'div', { class: 'wp-ok', text: `已登录：${state.ctx.nickname || state.ctx.userName || '公众号'}` })
       : el(doc, 'div', { class: 'wp-warn', text: state.ctxError || '尚未检测到公众号登录态' });
@@ -3419,7 +3636,9 @@ function createPanel(options = {}) {
       ])
     );
 
-    body.appendChild(el(doc, 'div', { class: 'wp-card' }, [loginLine, renderLoginActions()]));
+    body.appendChild(
+      el(doc, 'div', { class: 'wp-card' }, [loginLine, renderDiagnosticsHint(), renderLoginActions()])
+    );
     const warn = renderWarnings();
     if (warn) body.appendChild(warn);
 
@@ -3915,6 +4134,7 @@ function createPanel(options = {}) {
       return;
     }
     if (act === 'copy-html') return copyHtml();
+    if (act === 'copy-diagnostics') return copyDiagnostics();
     if (act === 'open-login-page') {
       win.open('https://mp.weixin.qq.com/', '_blank');
       return;
@@ -3992,6 +4212,20 @@ function createPanel(options = {}) {
     }
     flushPersist();
     refreshStats();
+  }
+
+  async function copyDiagnostics() {
+    const report = buildDiagnosticReport();
+    try {
+      if (win.navigator && win.navigator.clipboard && win.navigator.clipboard.writeText) {
+        await win.navigator.clipboard.writeText(report);
+        win.alert('诊断信息已复制，可直接贴到 issue 里。');
+        return;
+      }
+      throw new Error('当前环境不支持剪贴板');
+    } catch (err) {
+      win.alert(`${err.message}\n\n${report}`);
+    }
   }
 
   async function copyHtml() {
